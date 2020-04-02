@@ -12,6 +12,9 @@
  * Configuration
  */
 
+//#define USER_AGENT	"cpp-httplib/0.5"
+#define USER_AGENT  "Mozilla / 5.0 (Windows NT 10.0; Win64; x64) AppleWebKit / 537.36 (KHTML, like Gecko) Chrome / 74.0.3729.169 Safari / 537.36"
+
 #ifndef CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND
 #define CPPHTTPLIB_KEEPALIVE_TIMEOUT_SECOND 5
 #endif
@@ -227,6 +230,9 @@ public:
 using ContentProvider =
     std::function<void(size_t offset, size_t length, DataSink &sink)>;
 
+using ContentProvider_ =
+	std::function<int(std::string path, DataSink &sink)>;
+
 using ContentReceiver =
     std::function<bool(const char *data, size_t data_length)>;
 
@@ -253,6 +259,19 @@ public:
   MultipartReader muitlpart_reader_;
 };
 
+/*扩展自定义结构体,上传文件*/
+struct MultipartFormDataEx
+{
+	std::string name;
+	std::string filename;
+	std::string boundary;
+	std::string content_type;
+	size_t content_length;
+	std::string file_path;
+	ContentProvider_ content_provider;
+};
+using MultipartFormDataItemsEx = std::vector<MultipartFormDataEx>;
+
 using Range = std::pair<ssize_t, ssize_t>;
 using Ranges = std::vector<Range>;
 
@@ -275,6 +294,9 @@ struct Request {
   ResponseHandler response_handler;
   ContentReceiver content_receiver;
   Progress progress;
+
+  /*自定义数据*/
+  MultipartFormDataItemsEx filesEx;
 
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
   const SSL *ssl;
@@ -628,6 +650,9 @@ public:
 
   std::shared_ptr<Response> Post(const char *path, const Headers &headers,
                                  const MultipartFormDataItems &items);
+
+  std::shared_ptr<Response> Post(const char*path, const Headers &header,
+								const MultipartFormDataItemsEx &items);
 
   std::shared_ptr<Response> Put(const char *path, const std::string &body,
                                 const char *content_type);
@@ -1196,25 +1221,49 @@ inline int select_read(socket_t sock, time_t sec, time_t usec) {
 }
 
 inline int select_write(socket_t sock, time_t sec, time_t usec) {
+	int ret = -1;
+	int try_count = 0;
+	do 
+	{
 #ifdef CPPHTTPLIB_USE_POLL
-  struct pollfd pfd_read;
-  pfd_read.fd = sock;
-  pfd_read.events = POLLOUT;
+		struct pollfd pfd_read;
+		pfd_read.fd = sock;
+		pfd_read.events = POLLOUT;
 
-  auto timeout = static_cast<int>(sec * 1000 + usec / 1000);
+		auto timeout = static_cast<int>(sec * 1000 + usec / 1000);
 
-  return poll(&pfd_read, 1, timeout);
+		ret = poll(&pfd_read, 1, timeout);
 #else
-  fd_set fds;
-  FD_ZERO(&fds);
-  FD_SET(sock, &fds);
+		fd_set fds;
+		FD_ZERO(&fds);
+		FD_SET(sock, &fds);
 
-  timeval tv;
-  tv.tv_sec = static_cast<long>(sec);
-  tv.tv_usec = static_cast<decltype(tv.tv_usec)>(usec);
-
-  return select(static_cast<int>(sock + 1), nullptr, &fds, nullptr, &tv);
+		timeval tv;
+		tv.tv_sec = static_cast<long>(sec);
+		tv.tv_usec = static_cast<decltype(tv.tv_usec)>(usec);
+		ret = select(static_cast<int>(sock + 1), nullptr, &fds, nullptr, &tv);
 #endif
+		if (ret <= 0)
+		{
+#ifdef _WIN32
+			printf("select_write failed try_count:%d, err:%d!\n", try_count, GetLastError());
+#else
+			printf("select_write failed try_count:%d, err:%d,description:%s!\n", try_count, errno, strerror(errno));
+#endif
+			if (ret == 0)
+			{
+				try_count++;
+				//休眠等待可写
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				continue;
+			}
+		}
+		else
+		{
+			return ret;
+		}
+	} while (try_count < 30);
+  return ret;
 }
 
 inline bool wait_until_socket_is_ready(socket_t sock, time_t sec, time_t usec) {
@@ -2873,7 +2922,19 @@ inline ssize_t SocketStream::read(char *ptr, size_t size) {
 }
 
 inline ssize_t SocketStream::write(const char *ptr, size_t size) {
-  if (is_writable()) { return send(sock_, ptr, size, 0); }
+  if (is_writable()) 
+  { 
+	  int ret = send(sock_, ptr, size, 0);
+	  if (ret <= 0)
+	  {
+#ifdef _WIN32
+		  printf("SocketStream::write send failed err:%d!\n", GetLastError());
+#else
+		  printf("SocketStream::write send failed err:%d,description:%s!\n", errno, strerror(errno));
+#endif
+	  }
+	  return ret;
+  }
   return -1;
 }
 
@@ -3899,14 +3960,37 @@ inline bool Client::write_request(Stream &strm, const Request &req,
   if (!req.has_header("Accept")) { headers.emplace("Accept", "*/*"); }
 
   if (!req.has_header("User-Agent")) {
-    headers.emplace("User-Agent", "cpp-httplib/0.5");
+    headers.emplace("User-Agent", USER_AGENT);
   }
 
   if (req.body.empty()) {
     if (req.content_provider) {
       auto length = std::to_string(req.content_length);
       headers.emplace("Content-Length", length);
-    } else {
+    }
+	else if (!req.filesEx.empty())
+	{
+		//文件上传
+		MultipartFormDataEx dataEx = req.filesEx[0];
+		std::string content_type = "multipart/form-data; boundary=" + dataEx.boundary;
+		headers.emplace("Content-Type", content_type);
+		//获取长度
+		std::string disposition_info;
+		disposition_info += "--" + dataEx.boundary + "\r\n";
+		disposition_info += "Content-Disposition: form-data; name=\"" + dataEx.name + "\"";
+		if (!dataEx.filename.empty()) {
+			disposition_info += "; filename=\"" + dataEx.filename + "\"";
+		}
+		disposition_info += "\r\n";
+		if (!dataEx.content_type.empty()) {
+			disposition_info += "Content-Type: " + dataEx.content_type + "\r\n";
+		}
+		disposition_info += "\r\n";
+		std::string end = "\r\n--" + dataEx.boundary + "--\r\n";
+		auto length = std::to_string(disposition_info.length() + dataEx.content_length + end.length());
+		headers.emplace("Content-Length", length);
+	}
+	else {
       headers.emplace("Content-Length", "0");
     }
   } else {
@@ -3947,6 +4031,7 @@ inline bool Client::write_request(Stream &strm, const Request &req,
       data_sink.write = [&](const char *d, size_t l) {
         auto written_length = strm.write(d, l);
         offset += static_cast<size_t>(written_length);
+		//printf("data_sink written_length:%d, len:%d, offset:%d\n", written_length, l, offset);
       };
       data_sink.is_writable = [&](void) { return strm.is_writable(); };
 
@@ -3954,6 +4039,62 @@ inline bool Client::write_request(Stream &strm, const Request &req,
         req.content_provider(offset, end_offset - offset, data_sink);
       }
     }
+	else if (!req.filesEx.empty())
+	{
+
+		auto item = req.filesEx[0];
+		std::string body;
+		std::string boundary = item.boundary;
+		body += "--" + boundary + "\r\n";
+		body += "Content-Disposition: form-data; name=\"" + item.name + "\"";
+		if (!item.filename.empty()) {
+			body += "; filename=\"" + item.filename + "\"";
+		}
+		body += "\r\n";
+		if (!item.content_type.empty()) {
+			body += "Content-Type: " + item.content_type + "\r\n";
+		}
+		body += "\r\n";
+		strm.write(body);
+		{
+			size_t offset = 0;
+			size_t end_offset = item.content_length;
+			int errer_code = 0;
+
+			DataSink data_sink;
+			data_sink.write = [&](const char *d, size_t l) {
+				auto written_length = strm.write(d, l);
+				if (written_length > 0)
+				{
+					offset += static_cast<size_t>(written_length);
+					//printf("data_sink written_length:%d, len:%d, offset:%d\n", written_length, l, offset);
+				}
+				else
+				{
+					//数据发送失败
+					printf("************ send data to server failed!\n");
+					errer_code = -1;
+				}
+			};
+			data_sink.is_writable = [&](void) { return strm.is_writable(); };
+
+			while (offset < end_offset) {
+				if (item.content_provider(item.file_path, data_sink) < 0)
+				{
+					printf("read file failed!\n");
+					return false;
+				}
+				if (errer_code != 0)
+				{
+					printf("exit send data!\n");
+					return false;
+				}
+			}
+		}
+		//发送结束信息
+		body = "\r\n--" + boundary + "--\r\n";
+		strm.write(body);
+	}
   } else {
     strm.write(req.body);
   }
@@ -4233,6 +4374,22 @@ Client::Post(const char *path, const Headers &headers,
 
   std::string content_type = "multipart/form-data; boundary=" + boundary;
   return Post(path, headers, body, content_type.c_str());
+}
+
+
+inline std::shared_ptr<Response> 
+Client::Post(const char*path, const Headers &headers,
+			 const MultipartFormDataItemsEx &items)
+{
+	Request req;
+	req.method = "POST";
+	req.headers = headers;
+	req.path = path;
+	req.filesEx = items;
+
+	auto res = std::make_shared<Response>();
+
+	return send(req, *res) ? res : nullptr;
 }
 
 inline std::shared_ptr<Response> Client::Put(const char *path,
